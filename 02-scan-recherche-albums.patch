@@ -1,0 +1,709 @@
+diff --git a/app/src/main/kotlin/moe/rukamori/archivetune/MainActivity.kt b/app/src/main/kotlin/moe/rukamori/archivetune/MainActivity.kt
+index 148b141..b00918f 100644
+--- a/app/src/main/kotlin/moe/rukamori/archivetune/MainActivity.kt
++++ b/app/src/main/kotlin/moe/rukamori/archivetune/MainActivity.kt
+@@ -1081,7 +1081,8 @@ class MainActivity : ComponentActivity() {
+                         }
+                     }
+ 
+-                    var searchSource by rememberEnumPreference(SearchSourceKey, SearchSource.ONLINE)
++                    // Mode local-first : la recherche porte uniquement sur la bibliothèque locale.
++                    val searchSource = SearchSource.LOCAL
+ 
+                     val searchBarFocusRequester = remember { FocusRequester() }
+                     val tvRailFocusRequester = remember { FocusRequester() }
+@@ -2146,29 +2147,6 @@ class MainActivity : ComponentActivity() {
+                                                                     )
+                                                                 }
+                                                             }
+-                                                            IconButton(
+-                                                                onClick = {
+-                                                                    searchSource =
+-                                                                        if (searchSource ==
+-                                                                            SearchSource.ONLINE
+-                                                                        ) {
+-                                                                            SearchSource.LOCAL
+-                                                                        } else {
+-                                                                            SearchSource.ONLINE
+-                                                                        }
+-                                                                },
+-                                                            ) {
+-                                                                Icon(
+-                                                                    painter =
+-                                                                        painterResource(
+-                                                                            when (searchSource) {
+-                                                                                SearchSource.LOCAL -> R.drawable.library_music
+-                                                                                SearchSource.ONLINE -> R.drawable.language
+-                                                                            },
+-                                                                        ),
+-                                                                    contentDescription = null,
+-                                                                )
+-                                                            }
+                                                         } else if (currentRoute?.startsWith(OnlineSearchResultRoutePrefix) == true) {
+                                                             OnlineSearchSortMenu(
+                                                                 selectedSort = onlineSearchSort,
+diff --git a/app/src/main/kotlin/moe/rukamori/archivetune/localmedia/LocalSongScanner.kt b/app/src/main/kotlin/moe/rukamori/archivetune/localmedia/LocalSongScanner.kt
+index db9f5b0..318b2a0 100644
+--- a/app/src/main/kotlin/moe/rukamori/archivetune/localmedia/LocalSongScanner.kt
++++ b/app/src/main/kotlin/moe/rukamori/archivetune/localmedia/LocalSongScanner.kt
+@@ -25,10 +25,16 @@ import java.util.UUID
+ import javax.inject.Inject
+ import javax.inject.Singleton
+ import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Deferred
+ import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.currentCoroutineContext
+ import kotlinx.coroutines.ensureActive
+ import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.Semaphore
++import kotlinx.coroutines.sync.withPermit
+ import kotlinx.coroutines.sync.withLock
+ import kotlinx.coroutines.withContext
+ import moe.rukamori.archivetune.R
+@@ -206,13 +212,15 @@ class LocalSongScanner @Inject constructor(
+             val unchanged = isUnchanged(scanned, previous?.song, previousFormats[scanned.id])
+             var track = if (unchanged && previous != null) {
+                 scanned.copy(
++                    title = previous.song.title,
++                    artists = previous.artists.map { artist -> artist.name }.ifEmpty { scanned.artists },
+                     albumName = scanned.albumName ?: previous.song.albumName,
+                     albumArtist = scanned.albumArtist ?: previous.song.albumArtist,
+                     year = scanned.year ?: previous.song.year,
+                     thumbnailUrl = scanned.thumbnailUrl ?: previous.song.thumbnailUrl?.takeUnless { it.startsWith("content://media/") },
+                     trackNumber = scanned.trackNumber ?: previous.song.trackNumber,
+                     discNumber = scanned.discNumber ?: previous.song.discNumber,
+-                    remoteAlbumId = previous.album?.takeUnless { it.isLocal }?.id,
++                    remoteAlbumId = null,
+                 )
+             } else scanned
+             val lookupArtist = track.albumArtist?.let(::splitArtistNames)?.firstOrNull()
+@@ -227,7 +235,8 @@ class LocalSongScanner @Inject constructor(
+                 durationSeconds = if (lookupAlbum) 0 else track.durationSeconds,
+                 year = track.year,
+             )
+-            val needsLookup = !unchanged || track.albumArtist == null || track.year == null || track.thumbnailUrl == null || track.remoteAlbumId == null
++            // Mode local-first : aucune recherche en ligne, le regroupement se fait uniquement d'après les tags des fichiers.
++            val needsLookup = false
+             val match = if (cache.containsKey(query)) {
+                 cache[query]
+             } else if (!lookupFailed && lookupArtist != null && needsLookup) {
+@@ -381,71 +390,102 @@ class LocalSongScanner @Inject constructor(
+         }.joinToString(" AND ")
+         val unknownArtist = context.getString(R.string.unknown_artist)
+         val unknownTitle = context.getString(R.string.unknown)
+-        val tracks = mutableListOf<LocalTrackRecord>()
+-        val lyricsExtractor = EmbeddedLyricsExtractor(context.contentResolver)
+-        val cursor = context.contentResolver.query(
+-            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+-            projection,
+-            selection,
+-            null,
+-            "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC, ${MediaStore.Audio.Media._ID} ASC",
+-        ) ?: throw IOException("MediaStore returned no audio cursor")
+-        cursor.use {
+-            val idIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
+-            val titleIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
+-            val displayNameIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
+-            val artistIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
+-            val albumIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM)
+-            val albumIdIndex = it.getColumnIndex(MediaStore.Audio.Media.ALBUM_ID)
+-            val albumArtistIndex = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) it.getColumnIndex(MediaStore.Audio.Media.ALBUM_ARTIST) else -1
+-            val durationIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
+-            val yearIndex = it.getColumnIndex(MediaStore.Audio.Media.YEAR)
+-            val trackIndex = it.getColumnIndex(MediaStore.Audio.Media.TRACK)
+-            val modifiedIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_MODIFIED)
+-            val sizeIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE)
+-            val mimeIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.MIME_TYPE)
+-            val relativeIndex = it.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+-            val dataIndex = it.getColumnIndex(MediaStore.MediaColumns.DATA)
+-            while (it.moveToNext()) {
+-                currentCoroutineContext().ensureActive()
+-                val folder = resolveNormalizedFolderPath(it.getStringOrNull(relativeIndex), it.getStringOrNull(dataIndex))
+-                if (!shouldIncludeFolder(folder, included) || shouldExcludeFolder(folder, excluded)) continue
+-                val displayName = it.getStringOrNull(displayNameIndex)
+-                val mime = it.getStringOrNull(mimeIndex)?.takeIf(String::isNotBlank) ?: "audio/*"
+-                if (!SupportedLocalAudio.isSupported(displayName, mime)) continue
+-                val uri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, it.getLong(idIndex))
+-                val modified = it.getLong(modifiedIndex)
+-                val size = it.getLong(sizeIndex).coerceAtLeast(0L)
+-                val metadata = metadataReader.read(uri, modified, size)
+-                val duration = metadata.durationSeconds ?: (it.getLong(durationIndex).coerceAtLeast(0L) / 1000L)
+-                    .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+-                if (duration < scanConfig.sanitizedMinimumDurationSeconds) continue
+-                val artist = metadata.artist ?: cleanTag(it.getStringOrNull(artistIndex))
+-                val album = metadata.album ?: cleanTag(it.getStringOrNull(albumIndex))
+-                val encodedTrack = it.getIntOrNull(trackIndex)?.takeIf { value -> value > 0 }
+-                val albumId = it.getLongOrNull(albumIdIndex)?.takeIf { value -> value > 0L }
+-                tracks += LocalTrackRecord(
+-                    id = uri.toString(),
+-                    title = metadata.title ?: cleanTag(it.getStringOrNull(titleIndex))
+-                        ?: displayName?.substringBeforeLast('.')?.takeIf(String::isNotBlank) ?: unknownTitle,
+-                    artists = artist?.let(::splitArtistNames).orEmpty().ifEmpty { listOf(unknownArtist) },
+-                    albumName = album,
+-                    albumArtist = metadata.albumArtist ?: cleanTag(it.getStringOrNull(albumArtistIndex)),
+-                    trackNumber = metadata.trackNumber ?: encodedTrack?.rem(1000)?.takeIf { value -> value > 0 },
+-                    discNumber = metadata.discNumber ?: encodedTrack?.div(1000)?.takeIf { value -> value > 0 },
+-                    durationSeconds = duration,
+-                    year = metadata.year ?: it.getIntOrNull(yearIndex)?.takeIf { value -> value in 1..9999 },
+-                    dateModified = modified.takeIf { value -> value > 0L }
+-                        ?.let { value -> LocalDateTime.ofInstant(Instant.ofEpochSecond(value), ZoneId.systemDefault()) },
+-                    sizeBytes = size,
+-                    mimeType = mime,
+-                    thumbnailUrl = metadata.thumbnailUrl,
+-                    mediaStoreThumbnailUrl = albumId?.takeIf { album != null }
+-                        ?.let { value -> ContentUris.withAppendedId(AlbumArtUri, value).toString() },
+-                    embeddedLyrics = lyricsExtractor.extract(contentUri = uri, displayName = displayName, mimeType = mime)
+-                        ?.let(LyricsUtils::lyricsOrNotFound)?.takeIf { value -> value != LyricsEntity.LYRICS_NOT_FOUND },
+-                )
++        val knownIds = database.localSongIds()
++        val knownSongs = loadSongs(knownIds)
++        val knownFormats = loadFormats(knownIds)
++        val permits = Semaphore(ReadParallelism)
++        val tracks = coroutineScope {
++            val pending = mutableListOf<Deferred<LocalTrackRecord?>>()
++            val cursor = context.contentResolver.query(
++                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
++                projection,
++                selection,
++                null,
++                "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC, ${MediaStore.Audio.Media._ID} ASC",
++            ) ?: throw IOException("MediaStore returned no audio cursor")
++            cursor.use {
++                val idIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
++                val titleIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
++                val displayNameIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
++                val artistIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
++                val albumIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM)
++                val albumIdIndex = it.getColumnIndex(MediaStore.Audio.Media.ALBUM_ID)
++                val albumArtistIndex = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) it.getColumnIndex(MediaStore.Audio.Media.ALBUM_ARTIST) else -1
++                val durationIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
++                val yearIndex = it.getColumnIndex(MediaStore.Audio.Media.YEAR)
++                val trackIndex = it.getColumnIndex(MediaStore.Audio.Media.TRACK)
++                val modifiedIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_MODIFIED)
++                val sizeIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE)
++                val mimeIndex = it.getColumnIndexOrThrow(MediaStore.Audio.Media.MIME_TYPE)
++                val relativeIndex = it.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
++                val dataIndex = it.getColumnIndex(MediaStore.MediaColumns.DATA)
++                while (it.moveToNext()) {
++                    currentCoroutineContext().ensureActive()
++                    val folder = resolveNormalizedFolderPath(it.getStringOrNull(relativeIndex), it.getStringOrNull(dataIndex))
++                    if (!shouldIncludeFolder(folder, included) || shouldExcludeFolder(folder, excluded)) continue
++                    val displayName = it.getStringOrNull(displayNameIndex)
++                    val mime = it.getStringOrNull(mimeIndex)?.takeIf(String::isNotBlank) ?: "audio/*"
++                    if (!SupportedLocalAudio.isSupported(displayName, mime)) continue
++                    val uri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, it.getLong(idIndex))
++                    val modified = it.getLong(modifiedIndex)
++                    val size = it.getLong(sizeIndex).coerceAtLeast(0L)
++                    val mediaTitle = cleanTag(it.getStringOrNull(titleIndex))
++                    val mediaArtist = cleanTag(it.getStringOrNull(artistIndex))
++                    val mediaAlbum = cleanTag(it.getStringOrNull(albumIndex))
++                    val mediaAlbumArtist = cleanTag(it.getStringOrNull(albumArtistIndex))
++                    val mediaDurationSeconds = (it.getLong(durationIndex).coerceAtLeast(0L) / 1000L)
++                        .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
++                    val mediaYear = it.getIntOrNull(yearIndex)?.takeIf { value -> value in 1..9999 }
++                    val encodedTrack = it.getIntOrNull(trackIndex)?.takeIf { value -> value > 0 }
++                    val albumId = it.getLongOrNull(albumIdIndex)?.takeIf { value -> value > 0L }
++                    val dateModified = modified.takeIf { value -> value > 0L }
++                        ?.let { value -> LocalDateTime.ofInstant(Instant.ofEpochSecond(value), ZoneId.systemDefault()) }
++                    val id = uri.toString()
++                    val previousSong = knownSongs[id]?.song
++                    val previousFormat = knownFormats[id]
++                    // Fichier déjà analysé et non modifié : inutile de le relire.
++                    val unchanged = previousSong != null && previousFormat != null && dateModified != null &&
++                        previousSong.dateModified == dateModified && previousFormat.contentLength == size
++                    pending += async {
++                        permits.withPermit {
++                            currentCoroutineContext().ensureActive()
++                            val metadata = if (unchanged) LocalAudioMetadata() else metadataReader.read(uri, modified, size)
++                            val duration = metadata.durationSeconds ?: mediaDurationSeconds
++                            if (duration < scanConfig.sanitizedMinimumDurationSeconds) return@withPermit null
++                            val artist = metadata.artist ?: mediaArtist
++                            val album = metadata.album ?: mediaAlbum
++                            LocalTrackRecord(
++                                id = id,
++                                title = metadata.title ?: mediaTitle
++                                    ?: displayName?.substringBeforeLast('.')?.takeIf(String::isNotBlank) ?: unknownTitle,
++                                artists = artist?.let(::splitArtistNames).orEmpty().ifEmpty { listOf(unknownArtist) },
++                                albumName = album,
++                                albumArtist = metadata.albumArtist ?: mediaAlbumArtist,
++                                trackNumber = metadata.trackNumber ?: encodedTrack?.rem(1000)?.takeIf { value -> value > 0 },
++                                discNumber = metadata.discNumber ?: encodedTrack?.div(1000)?.takeIf { value -> value > 0 },
++                                durationSeconds = duration,
++                                year = metadata.year ?: mediaYear,
++                                dateModified = dateModified,
++                                sizeBytes = size,
++                                mimeType = mime,
++                                thumbnailUrl = metadata.thumbnailUrl,
++                                mediaStoreThumbnailUrl = albumId?.takeIf { album != null }
++                                    ?.let { value -> ContentUris.withAppendedId(AlbumArtUri, value).toString() },
++                                embeddedLyrics = if (unchanged) {
++                                    null
++                                } else {
++                                    EmbeddedLyricsExtractor(context.contentResolver)
++                                        .extract(contentUri = uri, displayName = displayName, mimeType = mime)
++                                        ?.let(LyricsUtils::lyricsOrNotFound)
++                                        ?.takeIf { value -> value != LyricsEntity.LYRICS_NOT_FOUND }
++                                },
++                                keepExistingLyrics = unchanged,
++                            )
++                        }
++                    }
++                }
+             }
++            pending.awaitAll().filterNotNull()
+         }
+         return tracks
+     }
+@@ -480,6 +520,7 @@ class LocalSongScanner @Inject constructor(
+         track: LocalTrackRecord,
+         existingLyrics: LyricsEntity?,
+     ) {
++        if (track.keepExistingLyrics) return
+         val embeddedLyrics = track.embeddedLyrics
+         if (embeddedLyrics != null) {
+             if (existingLyrics == null || existingLyrics.hasGenericSource()) {
+@@ -577,6 +618,7 @@ class LocalSongScanner @Inject constructor(
+         val matchedArtistName: String? = null,
+         val artistThumbnailUrl: String? = null,
+         val remoteAlbumId: String? = null,
++        val keepExistingLyrics: Boolean = false,
+     )
+ 
+     private companion object {
+@@ -585,5 +627,6 @@ class LocalSongScanner @Inject constructor(
+         const val LocalArtworkDirectoryName = "local_music_artwork"
+         const val LogTag = "LocalSongScanner"
+         const val SqlBatchSize = 900
++        const val ReadParallelism = 4
+     }
+ }
+diff --git a/app/src/main/kotlin/moe/rukamori/archivetune/ui/screens/LocalHomeScreen.kt b/app/src/main/kotlin/moe/rukamori/archivetune/ui/screens/LocalHomeScreen.kt
+index 9af9af6..de87ea5 100644
+--- a/app/src/main/kotlin/moe/rukamori/archivetune/ui/screens/LocalHomeScreen.kt
++++ b/app/src/main/kotlin/moe/rukamori/archivetune/ui/screens/LocalHomeScreen.kt
+@@ -9,6 +9,8 @@ package moe.rukamori.archivetune.ui.screens
+ 
+ import android.Manifest
+ import android.content.pm.PackageManager
++import android.net.Uri
++import android.provider.DocumentsContract
+ import android.os.Build
+ import androidx.activity.compose.rememberLauncherForActivityResult
+ import androidx.activity.result.contract.ActivityResultContracts
+@@ -34,6 +36,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
+ import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.IconButton
++import androidx.compose.material3.LinearProgressIndicator
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.OutlinedButton
+ import androidx.compose.material3.Surface
+@@ -57,6 +60,7 @@ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
+ import androidx.core.content.ContextCompat
++import androidx.datastore.preferences.core.booleanPreferencesKey
+ import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import androidx.navigation.NavController
+@@ -64,6 +68,8 @@ import kotlinx.coroutines.launch
+ import moe.rukamori.archivetune.LocalPlayerAwareWindowInsets
+ import moe.rukamori.archivetune.LocalPlayerConnection
+ import moe.rukamori.archivetune.R
++import moe.rukamori.archivetune.constants.ChipSortTypeKey
++import moe.rukamori.archivetune.constants.LibraryFilter
+ import moe.rukamori.archivetune.constants.LocalSongsExcludedFoldersKey
+ import moe.rukamori.archivetune.constants.LocalSongsIncludedFoldersKey
+ import moe.rukamori.archivetune.constants.LocalSongsMinDurationSecondsKey
+@@ -78,9 +84,43 @@ import moe.rukamori.archivetune.ui.component.LocalMenuState
+ import moe.rukamori.archivetune.ui.component.PlaylistGridItem
+ import moe.rukamori.archivetune.ui.component.SongGridItem
+ import moe.rukamori.archivetune.ui.menu.SongMenu
++import moe.rukamori.archivetune.utils.rememberEnumPreference
+ import moe.rukamori.archivetune.utils.rememberPreference
+ import moe.rukamori.archivetune.viewmodels.LocalHomeViewModel
+ import moe.rukamori.archivetune.viewmodels.LocalMix
++import moe.rukamori.archivetune.viewmodels.LocalSongsScanState
++
++private val LocalHomeOnboardingDoneKey = booleanPreferencesKey("local_home_onboarding_done")
++
++/**
++ * Retourne une action qui ouvre la bibliothèque directement sur l'onglet demandé
++ * (Albums, Artistes, Playlists…). L'onglet affiché est piloté par la même préférence
++ * que celle utilisée par l'écran Bibliothèque.
++ */
++@Composable
++internal fun rememberLibraryTabOpener(navController: NavController): (LibraryFilter) -> Unit {
++    var libraryFilter by rememberEnumPreference(ChipSortTypeKey, LibraryFilter.LIBRARY)
++    return { filter ->
++        libraryFilter = filter
++        if (navController.currentDestination?.route != Screens.Library.route) {
++            navController.navigate(Screens.Library.route) {
++                popUpTo(navController.graph.startDestinationId) { saveState = true }
++                launchSingleTop = true
++                restoreState = true
++            }
++        }
++    }
++}
++
++private fun Uri.toFolderEntry(): String? {
++    if (!DocumentsContract.isTreeUri(this)) return null
++    val treeDocumentId =
++        runCatching { DocumentsContract.getTreeDocumentId(this) }
++            .getOrNull()
++            .orEmpty()
++    val relativeFolder = treeDocumentId.substringAfter(':', missingDelimiterValue = treeDocumentId)
++    return LocalSongScanConfig.normalizeFolderEntry(relativeFolder).takeIf(String::isNotEmpty)
++}
+ 
+ /**
+  * Accueil centré sur la bibliothèque locale : mixes frais, playlists, récents,
+@@ -105,6 +145,8 @@ fun LocalHomeScreen(
+     val mediaMetadata by playerConnection.mediaMetadata.collectAsState()
+ 
+     val localSongs by viewModel.localSongs.collectAsStateWithLifecycle()
++    val scanState by viewModel.scanState.collectAsStateWithLifecycle()
++    val openLibrary = rememberLibraryTabOpener(navController)
+     val mixes by viewModel.mixes.collectAsStateWithLifecycle()
+     val playlists by viewModel.playlists.collectAsStateWithLifecycle()
+     val recentlyAdded by viewModel.recentlyAdded.collectAsStateWithLifecycle()
+@@ -116,7 +158,7 @@ fun LocalHomeScreen(
+ 
+     // Même configuration d'analyse que l'écran « Musique locale ».
+     val (minimumDurationSeconds, _) = rememberPreference(LocalSongsMinDurationSecondsKey, 0)
+-    val (includedFolders, _) = rememberPreference(LocalSongsIncludedFoldersKey, emptySet<String>())
++    val (includedFolders, onIncludedFoldersChange) = rememberPreference(LocalSongsIncludedFoldersKey, emptySet<String>())
+     val (excludedFolders, _) = rememberPreference(LocalSongsExcludedFoldersKey, emptySet<String>())
+     val scanConfig =
+         remember(minimumDurationSeconds, includedFolders, excludedFolders) {
+@@ -146,8 +188,25 @@ fun LocalHomeScreen(
+         ) { granted ->
+             hasStoragePermission = granted
+         }
+-    LaunchedEffect(viewModel, hasStoragePermission, scanConfig) {
+-        if (hasStoragePermission) {
++
++    // Première utilisation : on demande d'abord quels dossiers analyser en priorité.
++    val (onboardingDone, setOnboardingDone) = rememberPreference(LocalHomeOnboardingDoneKey, false)
++    var pickedFolders by remember { mutableStateOf(emptySet<String>()) }
++    val folderPickerLauncher =
++        rememberLauncherForActivityResult(
++            contract = ActivityResultContracts.OpenDocumentTree(),
++        ) { uri ->
++            val folder = uri?.toFolderEntry() ?: return@rememberLauncherForActivityResult
++            pickedFolders = LocalSongScanConfig.deduplicateFolderEntries(pickedFolders + folder)
++        }
++    LaunchedEffect(localSongs.isNotEmpty()) {
++        if (localSongs.isNotEmpty() && !onboardingDone) setOnboardingDone(true)
++    }
++    val needsOnboarding = hasStoragePermission && !onboardingDone && localSongs.isEmpty()
++    val canScan = hasStoragePermission && !needsOnboarding
++
++    LaunchedEffect(viewModel, canScan, scanConfig) {
++        if (canScan) {
+             viewModel.scanDevice(scanConfig)
+         }
+     }
+@@ -237,6 +296,75 @@ fun LocalHomeScreen(
+             return@LazyColumn
+         }
+ 
++        if (needsOnboarding) {
++            item(key = "onboarding") {
++                Column(
++                    verticalArrangement = Arrangement.spacedBy(12.dp),
++                    modifier = Modifier.fillMaxWidth().padding(24.dp),
++                ) {
++                    Text(
++                        text = "Par où commencer ?",
++                        style = MaterialTheme.typography.titleLarge,
++                        fontWeight = FontWeight.SemiBold,
++                    )
++                    Text(
++                        text = "Choisis les dossiers à analyser en priorité : ta musique apparaît plus vite. " +
++                            "Tu pourras analyser le reste du téléphone ensuite.",
++                        style = MaterialTheme.typography.bodyMedium,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant,
++                    )
++                    pickedFolders.forEach { folder ->
++                        Text(
++                            text = "• $folder",
++                            style = MaterialTheme.typography.bodyMedium,
++                        )
++                    }
++                    OutlinedButton(
++                        onClick = { folderPickerLauncher.launch(null) },
++                        modifier = Modifier.fillMaxWidth(),
++                    ) {
++                        Text(if (pickedFolders.isEmpty()) "Choisir un dossier" else "Ajouter un autre dossier")
++                    }
++                    if (pickedFolders.isNotEmpty()) {
++                        Button(
++                            onClick = {
++                                onIncludedFoldersChange(pickedFolders)
++                                setOnboardingDone(true)
++                            },
++                            modifier = Modifier.fillMaxWidth(),
++                        ) {
++                            Text("Analyser ces dossiers")
++                        }
++                    }
++                    TextButton(
++                        onClick = {
++                            onIncludedFoldersChange(emptySet())
++                            setOnboardingDone(true)
++                        },
++                        modifier = Modifier.fillMaxWidth(),
++                    ) {
++                        Text("Analyser tout le téléphone")
++                    }
++                }
++            }
++            return@LazyColumn
++        }
++
++        if (scanState is LocalSongsScanState.Loading) {
++            item(key = "scan_progress") {
++                Column(
++                    verticalArrangement = Arrangement.spacedBy(8.dp),
++                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
++                ) {
++                    Text(
++                        text = "Analyse de ta bibliothèque…",
++                        style = MaterialTheme.typography.labelLarge,
++                    )
++                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
++                }
++            }
++        }
++
+         if (localSongs.isEmpty()) {
+             item(key = "empty") {
+                 LocalHomeMessage(
+@@ -271,6 +399,17 @@ fun LocalHomeScreen(
+             }
+         }
+ 
++        if (includedFolders.isNotEmpty()) {
++            item(key = "scan_rest") {
++                TextButton(
++                    onClick = { onIncludedFoldersChange(emptySet()) },
++                    modifier = Modifier.padding(horizontal = 8.dp),
++                ) {
++                    Text("Analyser aussi le reste de la musique")
++                }
++            }
++        }
++
+         if (mixes.isNotEmpty()) {
+             item(key = "mixes_header") {
+                 HomeSectionHeader(
+@@ -312,7 +451,7 @@ fun LocalHomeScreen(
+             item(key = "playlists_header") {
+                 HomeSectionHeader(
+                     title = "Tes playlists",
+-                    onClick = { navController.navigate("library") },
++                    onClick = { openLibrary(LibraryFilter.PLAYLISTS) },
+                 )
+             }
+             item(key = "playlists_row") {
+@@ -342,7 +481,7 @@ fun LocalHomeScreen(
+             item(key = "albums_header") {
+                 HomeSectionHeader(
+                     title = "Albums",
+-                    onClick = { navController.navigate("library") },
++                    onClick = { openLibrary(LibraryFilter.ALBUMS) },
+                 )
+             }
+             item(key = "albums_row") {
+@@ -368,7 +507,7 @@ fun LocalHomeScreen(
+             item(key = "artists_header") {
+                 HomeSectionHeader(
+                     title = "Artistes",
+-                    onClick = { navController.navigate("library") },
++                    onClick = { openLibrary(LibraryFilter.ARTISTS) },
+                 )
+             }
+             item(key = "artists_row") {
+diff --git a/app/src/main/kotlin/moe/rukamori/archivetune/ui/screens/LocalSearchHomeScreen.kt b/app/src/main/kotlin/moe/rukamori/archivetune/ui/screens/LocalSearchHomeScreen.kt
+new file mode 100644
+index 0000000..8d73065
+--- /dev/null
++++ b/app/src/main/kotlin/moe/rukamori/archivetune/ui/screens/LocalSearchHomeScreen.kt
+@@ -0,0 +1,159 @@
++/*
++ * ArchiveTune (2026)
++ * © Rukamori — github.com/rukamori
++ * GPL-3.0 License | Contributors: see git history
++ * Do not remove or alter this notice. - Per GPL-3.0 Section 4 & Section 5
++ */
++
++package moe.rukamori.archivetune.ui.screens
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.asPaddingValues
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
++import androidx.compose.ui.input.nestedscroll.nestedScroll
++import androidx.compose.ui.res.painterResource
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.navigation.NavController
++import moe.rukamori.archivetune.LocalPlayerAwareWindowInsets
++import moe.rukamori.archivetune.R
++import moe.rukamori.archivetune.constants.LibraryFilter
++
++/**
++ * Onglet Recherche en mode local : la recherche porte uniquement sur la bibliothèque
++ * (titres, albums, artistes, playlists). Plus aucune découverte YouTube Music.
++ */
++@Composable
++fun LocalSearchHomeScreen(
++    navController: NavController,
++    onSearchClick: () -> Unit,
++    headerScrollConnection: NestedScrollConnection? = null,
++) {
++    val openLibrary = rememberLibraryTabOpener(navController)
++
++    LazyColumn(
++        modifier =
++            Modifier
++                .fillMaxSize()
++                .then(
++                    if (headerScrollConnection != null) {
++                        Modifier.nestedScroll(headerScrollConnection)
++                    } else {
++                        Modifier
++                    },
++                ),
++        contentPadding = LocalPlayerAwareWindowInsets.current.asPaddingValues(),
++        verticalArrangement = Arrangement.spacedBy(12.dp),
++    ) {
++        item(key = "search_field") {
++            Surface(
++                onClick = onSearchClick,
++                shape = RoundedCornerShape(28.dp),
++                color = MaterialTheme.colorScheme.surfaceContainerHigh,
++                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
++            ) {
++                Row(
++                    verticalAlignment = Alignment.CenterVertically,
++                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
++                ) {
++                    Icon(painter = painterResource(R.drawable.search), contentDescription = null)
++                    Spacer(Modifier.width(12.dp))
++                    Text(
++                        text = "Rechercher dans ta bibliothèque",
++                        style = MaterialTheme.typography.bodyLarge,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant,
++                    )
++                }
++            }
++        }
++
++        item(key = "browse_title") {
++            Text(
++                text = "Parcourir",
++                style = MaterialTheme.typography.titleMedium,
++                fontWeight = FontWeight.SemiBold,
++                modifier = Modifier.padding(horizontal = 16.dp),
++            )
++        }
++
++        item(key = "browse_songs") {
++            BrowseRow(
++                label = "Tous les titres",
++                iconRes = R.drawable.music_note,
++                onClick = { navController.navigate("local_songs") },
++            )
++        }
++        item(key = "browse_albums") {
++            BrowseRow(
++                label = "Albums",
++                iconRes = R.drawable.album,
++                onClick = { openLibrary(LibraryFilter.ALBUMS) },
++            )
++        }
++        item(key = "browse_artists") {
++            BrowseRow(
++                label = "Artistes",
++                iconRes = R.drawable.artist,
++                onClick = { openLibrary(LibraryFilter.ARTISTS) },
++            )
++        }
++        item(key = "browse_playlists") {
++            BrowseRow(
++                label = "Playlists",
++                iconRes = R.drawable.queue_music,
++                onClick = { openLibrary(LibraryFilter.PLAYLISTS) },
++            )
++        }
++        item(key = "bottom_spacer") { Spacer(Modifier.height(24.dp)) }
++    }
++}
++
++@Composable
++private fun BrowseRow(
++    label: String,
++    iconRes: Int,
++    onClick: () -> Unit,
++) {
++    Surface(
++        onClick = onClick,
++        shape = RoundedCornerShape(20.dp),
++        color = MaterialTheme.colorScheme.secondaryContainer,
++        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
++    ) {
++        Row(
++            verticalAlignment = Alignment.CenterVertically,
++            modifier = Modifier.padding(horizontal = 20.dp, vertical = 18.dp),
++        ) {
++            Icon(
++                painter = painterResource(iconRes),
++                contentDescription = null,
++                tint = MaterialTheme.colorScheme.onSecondaryContainer,
++            )
++            Spacer(Modifier.width(16.dp))
++            Column {
++                Text(
++                    text = label,
++                    style = MaterialTheme.typography.titleMedium,
++                    color = MaterialTheme.colorScheme.onSecondaryContainer,
++                )
++            }
++        }
++    }
++}
+diff --git a/app/src/main/kotlin/moe/rukamori/archivetune/ui/screens/NavigationBuilder.kt b/app/src/main/kotlin/moe/rukamori/archivetune/ui/screens/NavigationBuilder.kt
+index 383effe..9a4e4eb 100644
+--- a/app/src/main/kotlin/moe/rukamori/archivetune/ui/screens/NavigationBuilder.kt
++++ b/app/src/main/kotlin/moe/rukamori/archivetune/ui/screens/NavigationBuilder.kt
+@@ -106,7 +106,7 @@ fun NavGraphBuilder.navigationBuilder(
+         LibraryScreen(navController = navController, scrollBehavior = libraryScrollBehavior)
+     }
+     composable(Screens.Search.route) {
+-        SearchScreen(
++        LocalSearchHomeScreen(
+             navController = navController,
+             onSearchClick = {
+                 navController.currentBackStackEntry
