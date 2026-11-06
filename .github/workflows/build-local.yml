@@ -1,0 +1,66 @@
+name: Build APK local-first
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '*.patch'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build APK (gms / mobile / arm64 / debug)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Apply modification patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.email "build@local"
+          git config user.name "build"
+          shopt -s nullglob
+          patches=(*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "Aucun fichier .patch : build du dépôt sans modification."
+            exit 0
+          fi
+          for p in $(printf '%s\n' "${patches[@]}" | sort); do
+            echo "Application de $p"
+            if ! git apply --3way "$p"; then
+              echo "::error::Le patch $p ne s'applique pas proprement. Envoie ce journal à Claude."
+              exit 1
+            fi
+          done
+
+      - name: Set up JDK 27
+        uses: actions/setup-java@v6
+        with:
+          java-version: '27'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-cleanup: on-success
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        run: ./gradlew assembleGmsMobileArm64Debug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: ArchiveTune-local-debug
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
